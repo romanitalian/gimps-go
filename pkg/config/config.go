@@ -39,6 +39,10 @@ type Config struct {
 	Verbose         bool
 	NoGUI           bool
 
+	// Logging settings
+	LogFile         string // Path to log file (empty = stdout)
+	LogLevel        string // Log level: debug, info, warning, error
+
 	// Internal
 	filePath        string
 	values          map[string]string
@@ -63,6 +67,8 @@ func NewConfig(filePath string) *Config {
 		StressTester:    false,
 		Verbose:         false,
 		NoGUI:           false,
+		LogFile:         "", // Default: stdout
+		LogLevel:        "info", // Default: info
 	}
 }
 
@@ -139,6 +145,10 @@ func (c *Config) parseKey(key, value string) {
 		c.Verbose = c.getBool(value, false)
 	case "nogui":
 		c.NoGUI = c.getBool(value, false)
+	case "logfile":
+		c.LogFile = value
+	case "loglevel":
+		c.LogLevel = value
 	}
 }
 
@@ -165,6 +175,8 @@ func (c *Config) Save() error {
 	c.writeKey(&sb, "StressTester", c.getBoolStr(c.StressTester))
 	c.writeKey(&sb, "Verbose", c.getBoolStr(c.Verbose))
 	c.writeKey(&sb, "NoGUI", c.getBoolStr(c.NoGUI))
+	c.writeKey(&sb, "LogFile", c.LogFile)
+	c.writeKey(&sb, "LogLevel", c.LogLevel)
 
 	// Write other values
 	for k, v := range c.values {
@@ -232,6 +244,7 @@ func (c *Config) isKnownKey(key string) bool {
 		"daymemory", "nightmemory", "daystarttime", "nightstarttime",
 		"runonbattery", "skiptrialfactoring", "jacobierrorcheck",
 		"stresstester", "verbose", "nogui",
+		"logfile", "loglevel",
 	}
 	keyLower := strings.ToLower(key)
 	for _, k := range knownKeys {

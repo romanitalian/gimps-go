@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/romanitalian/gimps-go/internal/algorithms"
+	"github.com/romanitalian/gimps-go/internal/math"
+	"github.com/romanitalian/gimps-go/pkg/logger"
 )
 
 // AssignmentManager is an interface for assignment management
@@ -24,6 +26,7 @@ type Manager struct {
 	workToDo     WorkUnitGetter
 	assignMgr    AssignmentManager
 	numWorkers   int
+	logger       *logger.Logger
 	ctx          context.Context
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
@@ -31,13 +34,14 @@ type Manager struct {
 }
 
 // NewManager creates a new worker manager
-func NewManager(numWorkers int, workToDo WorkUnitGetter, assignMgr AssignmentManager) *Manager {
+func NewManager(numWorkers int, workToDo WorkUnitGetter, assignMgr AssignmentManager, l *logger.Logger) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
 		workers:    make([]*Worker, 0, numWorkers),
 		workToDo:   workToDo,
 		assignMgr:  assignMgr,
 		numWorkers: numWorkers,
+		logger:     l,
 		ctx:        ctx,
 		cancel:     cancel,
 	}
@@ -50,7 +54,7 @@ func (m *Manager) Start() error {
 	
 	// Start workers
 	for i := 0; i < m.numWorkers; i++ {
-		worker := NewWorker(i, m.workToDo, m.assignMgr, m.ctx)
+		worker := NewWorker(i, m.workToDo, m.assignMgr, m.ctx, m.logger)
 		m.workers = append(m.workers, worker)
 		
 		m.wg.Add(1)
@@ -96,17 +100,19 @@ type Worker struct {
 	workToDo     WorkUnitGetter
 	assignMgr    AssignmentManager
 	ctx          context.Context
+	logger       *logger.Logger
 	currentWork  *WorkUnit
 	mu           sync.Mutex
 }
 
 // NewWorker creates a new worker
-func NewWorker(num int, workToDo WorkUnitGetter, assignMgr AssignmentManager, ctx context.Context) *Worker {
+func NewWorker(num int, workToDo WorkUnitGetter, assignMgr AssignmentManager, ctx context.Context, l *logger.Logger) *Worker {
 	return &Worker{
 		num:       num,
 		workToDo:  workToDo,
 		assignMgr: assignMgr,
 		ctx:       ctx,
+		logger:    l,
 	}
 }
 
@@ -188,18 +194,38 @@ func (w *Worker) processWork(unit *WorkUnit) {
 	}
 	
 	if err != nil {
-		fmt.Printf("Worker %d: Error processing work: %v\n", w.num, err)
+		var stage logger.Stage = logger.StageIdle
+		var exponent uint64
+		if w.currentWork != nil {
+			stage = logger.Stage(w.currentWork.Stage)
+			exponent = w.currentWork.N
+		}
+		w.logger.WorkerError(w.num, stage, exponent, "Error processing work: "+err.Error())
 	}
 }
 
 // processLL processes Lucas-Lehmer test
 func (w *Worker) processLL(k float64, b, n uint64, c int64) error {
 	w.currentWork.Stage = "LL"
+	stage := logger.StageLL
 	
-	result, err := algorithms.LucasLehmerTestFromWorkUnit(k, b, n, c)
+	// Use progress callback for logging
+	result, err := algorithms.LucasLehmerTestWithProgress(n, func(iteration, total uint64, residue *math.BigInt) error {
+		// Log progress periodically (every 1% or every 1000 iterations, whichever is more frequent)
+		if total > 0 && (iteration%1000 == 0 || iteration*100/total != (iteration-1)*100/total) {
+			w.logger.WorkerProgress(w.num, stage, n, iteration, total, 
+				fmt.Sprintf("Lucas-Lehmer iteration %d/%d", iteration, total))
+		}
+		return nil
+	})
+	
 	if err != nil {
 		return err
 	}
+	
+	// Log completion
+	w.logger.WorkerProgress(w.num, stage, n, n-2, n-2, 
+		fmt.Sprintf("Lucas-Lehmer test completed: isPrime=%v", result.IsPrime))
 	
 	// Send result
 	if w.assignMgr != nil {
@@ -216,11 +242,16 @@ func (w *Worker) processLL(k float64, b, n uint64, c int64) error {
 // processPRP processes PRP test
 func (w *Worker) processPRP(k float64, b, n uint64, c int64, prpBase uint32) error {
 	w.currentWork.Stage = "PRP"
+	stage := logger.StagePRP
 	
 	result, err := algorithms.PRPTestFromWorkUnit(k, b, n, c, prpBase)
 	if err != nil {
 		return err
 	}
+	
+	// Log completion
+	w.logger.WorkerProgress(w.num, stage, n, 100, 100, fmt.Sprintf("PRP test completed for exponent %d: isProbablePrime=%v", 
+		n, result.IsProbablePrime))
 	
 	// Send result
 	if w.assignMgr != nil {
@@ -237,6 +268,9 @@ func (w *Worker) processPRP(k float64, b, n uint64, c int64, prpBase uint32) err
 // processTF processes Trial Factoring
 func (w *Worker) processTF(k float64, b, n uint64, c int64, factorTo float64) error {
 	w.currentWork.Stage = "TF"
+	stage := logger.StageTF
+	
+	w.logger.WorkerProgress(w.num, stage, n, 0, 100, fmt.Sprintf("Starting trial factoring for exponent %d", n))
 	
 	result, err := algorithms.TrialFactorFromWorkUnit(k, b, n, c, factorTo)
 	if err != nil {
@@ -244,11 +278,15 @@ func (w *Worker) processTF(k float64, b, n uint64, c int64, factorTo float64) er
 	}
 	
 	if len(result.Factors) > 0 {
+		w.logger.WorkerProgress(w.num, stage, n, 100, 100, fmt.Sprintf("Factor found for exponent %d: %s", 
+			n, result.Factors[0].Text(10)))
 		// Factor found
 		if w.assignMgr != nil {
 			factorStr := result.Factors[0].Text(10)
 			w.assignMgr.SendResult(w.currentWork, uint32(w.num), factorStr, false, 0, "")
 		}
+	} else {
+		w.logger.WorkerProgress(w.num, stage, n, 100, 100, fmt.Sprintf("No factors found for exponent %d", n))
 	}
 	
 	return nil
@@ -257,6 +295,10 @@ func (w *Worker) processTF(k float64, b, n uint64, c int64, factorTo float64) er
 // processPM1 processes P-1 factoring
 func (w *Worker) processPM1(k float64, b, n uint64, c int64, B1, B2 uint64) error {
 	w.currentWork.Stage = "P-1"
+	stage := logger.StagePM1
+	
+	w.logger.WorkerProgress(w.num, stage, n, 0, 100, fmt.Sprintf("Starting P-1 factoring for exponent %d (B1=%d, B2=%d)", 
+		n, B1, B2))
 	
 	result, err := algorithms.PMinus1FactorFromWorkUnit(k, b, n, c, B1, B2)
 	if err != nil {
@@ -264,11 +306,15 @@ func (w *Worker) processPM1(k float64, b, n uint64, c int64, B1, B2 uint64) erro
 	}
 	
 	if result.Factor != nil {
+		w.logger.WorkerProgress(w.num, stage, n, 100, 100, fmt.Sprintf("P-1 factor found for exponent %d (stage %d): %s", 
+			n, result.Stage, result.Factor.Text(10)))
 		// Factor found
 		if w.assignMgr != nil {
 			factorStr := result.Factor.Text(10)
 			w.assignMgr.SendResult(w.currentWork, uint32(w.num), factorStr, false, 0, "")
 		}
+	} else {
+		w.logger.WorkerProgress(w.num, stage, n, 100, 100, fmt.Sprintf("No P-1 factor found for exponent %d", n))
 	}
 	
 	return nil
@@ -277,6 +323,10 @@ func (w *Worker) processPM1(k float64, b, n uint64, c int64, B1, B2 uint64) erro
 // processPP1 processes P+1 factoring
 func (w *Worker) processPP1(k float64, b, n uint64, c int64, B1, B2 uint64, nthRun int32) error {
 	w.currentWork.Stage = "P+1"
+	stage := logger.StagePP1
+	
+	w.logger.WorkerProgress(w.num, stage, n, 0, 100, fmt.Sprintf("Starting P+1 factoring for exponent %d (B1=%d, B2=%d, run=%d)", 
+		n, B1, B2, nthRun))
 	
 	result, err := algorithms.PPlus1FactorFromWorkUnit(k, b, n, c, B1, B2, nthRun)
 	if err != nil {
@@ -284,11 +334,15 @@ func (w *Worker) processPP1(k float64, b, n uint64, c int64, B1, B2 uint64, nthR
 	}
 	
 	if result.Factor != nil {
+		w.logger.WorkerProgress(w.num, stage, n, 100, 100, fmt.Sprintf("P+1 factor found for exponent %d (stage %d): %s", 
+			n, result.Stage, result.Factor.Text(10)))
 		// Factor found
 		if w.assignMgr != nil {
 			factorStr := result.Factor.Text(10)
 			w.assignMgr.SendResult(w.currentWork, uint32(w.num), factorStr, false, 0, "")
 		}
+	} else {
+		w.logger.WorkerProgress(w.num, stage, n, 100, 100, fmt.Sprintf("No P+1 factor found for exponent %d", n))
 	}
 	
 	return nil
@@ -297,6 +351,10 @@ func (w *Worker) processPP1(k float64, b, n uint64, c int64, B1, B2 uint64, nthR
 // processECM processes ECM factoring
 func (w *Worker) processECM(k float64, b, n uint64, c int64, B1, B2 uint64, numCurves uint32) error {
 	w.currentWork.Stage = "ECM"
+	stage := logger.StageECM
+	
+	w.logger.WorkerProgress(w.num, stage, n, 0, 100, fmt.Sprintf("Starting ECM factoring for exponent %d (B1=%d, B2=%d, curves=%d)", 
+		n, B1, B2, numCurves))
 	
 	result, err := algorithms.ECMFactorFromParams(k, b, n, c, B1, B2, numCurves)
 	if err != nil {
@@ -304,11 +362,16 @@ func (w *Worker) processECM(k float64, b, n uint64, c int64, B1, B2 uint64, numC
 	}
 	
 	if result.Factor != nil {
+		w.logger.WorkerProgress(w.num, stage, n, 100, 100, fmt.Sprintf("ECM factor found for exponent %d (curve %d, stage %d): %s", 
+			n, result.Curve, result.Stage, result.Factor.Text(10)))
 		// Factor found
 		if w.assignMgr != nil {
 			factorStr := result.Factor.Text(10)
 			w.assignMgr.SendResult(w.currentWork, uint32(w.num), factorStr, false, 0, "")
 		}
+	} else {
+		w.logger.WorkerProgress(w.num, stage, n, 100, 100, fmt.Sprintf("No ECM factor found for exponent %d after %d curves", 
+			n, numCurves))
 	}
 	
 	return nil
