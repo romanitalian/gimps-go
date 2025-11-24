@@ -68,7 +68,8 @@ func constructNumberFromParams(k float64, b, n uint64, c int64) *math.BigInt {
 	// b^n
 	bBig := math.NewBigIntFromUint64(b)
 	nBig := math.NewBigIntFromUint64(n)
-	bToN := math.ModPow(bBig, nBig, nil) // No modulus for intermediate calculation
+	// Use Exp directly for b^n (no modulus needed)
+	bToN := &math.BigInt{Int: new(big.Int).Exp(bBig.Int, nBig.Int, nil)}
 	
 	// k * b^n
 	if k != 1.0 {
